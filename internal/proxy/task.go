@@ -2196,6 +2196,9 @@ func (t *alterCollectionTask) PreExecute(ctx context.Context) error {
 	if err := common.ValidateNamespaceShardingEnabledNotAltered(t.GetProperties(), t.GetDeleteKeys()); err != nil {
 		return err
 	}
+	if err := common.ValidateRLSEnabledNotAltered(t.GetProperties(), t.GetDeleteKeys()); err != nil {
+		return err
+	}
 
 	collSchema, err := t.getMetaCache().GetCollectionSchema(ctx, t.GetDbName(), t.CollectionName)
 	if err != nil {
