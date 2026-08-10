@@ -154,8 +154,9 @@ PhyMembershipFilterExpr<LogicalExpr, ProbePolicy>::ExecVisitorImpl(
             const int size,
             TargetBitmapView res,
             TargetBitmapView valid_res) {
-        // data == nullptr means the chunk was skipped upstream; only the
-        // bitmap_input cursor needs to advance.
+        // A null data pointer means the payload was skipped or the value is
+        // NULL. The reader has already applied the authoritative validity to
+        // active candidates, so only the bitmap-input cursor must advance.
         if (data == nullptr) {
             processed_cursor += size;
             return;
@@ -189,8 +190,12 @@ PhyMembershipFilterExpr<LogicalExpr, ProbePolicy>::ExecVisitorImpl(
 
     int64_t processed_size;
     if (has_offset_input_) {
-        processed_size = ProcessDataByOffsets<T>(
-            execute_sub_batch, std::nullptr_t{}, input, res, valid_res);
+        processed_size = ProcessDataByOffsetsWithMask<T>(execute_sub_batch,
+                                                         std::nullptr_t{},
+                                                         input,
+                                                         res,
+                                                         valid_res,
+                                                         bitmap_input);
     } else {
         processed_size = ProcessDataChunks<T>(
             execute_sub_batch, std::nullptr_t{}, res, valid_res);
@@ -345,8 +350,9 @@ PhyMembershipFilterExpr<LogicalExpr, ProbePolicy>::ExecVisitorImplJson(
             TargetBitmapView res,
             TargetBitmapView valid_res,
             const std::string& pointer) {
-        // data == nullptr means the chunk was skipped upstream; only the
-        // bitmap_input cursor needs to advance.
+        // A null data pointer means the payload was skipped or the value is
+        // NULL. The reader has already applied the authoritative validity to
+        // active candidates, so only the bitmap-input cursor must advance.
         if (data == nullptr) {
             processed_cursor += size;
             return;
@@ -402,12 +408,14 @@ PhyMembershipFilterExpr<LogicalExpr, ProbePolicy>::ExecVisitorImplJson(
 
     int64_t processed_size;
     if (has_offset_input_) {
-        processed_size = ProcessDataByOffsets<milvus::Json>(execute_sub_batch,
-                                                            std::nullptr_t{},
-                                                            input,
-                                                            res,
-                                                            valid_res,
-                                                            pointer);
+        processed_size =
+            ProcessDataByOffsetsWithMask<milvus::Json>(execute_sub_batch,
+                                                       std::nullptr_t{},
+                                                       input,
+                                                       res,
+                                                       valid_res,
+                                                       bitmap_input,
+                                                       pointer);
     } else {
         processed_size = ProcessDataChunks<milvus::Json>(
             execute_sub_batch, std::nullptr_t{}, res, valid_res, pointer);
