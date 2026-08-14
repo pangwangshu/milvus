@@ -16,7 +16,7 @@ enabled.
 The runtime caller supplies an `rls_principal` string on RLS-protected
 operations. The principal is an application-level identity and is deliberately
 not derived from the authenticated Milvus username. Policies can reference that
-principal and its collection-scoped tags to build a query/search/delete
+principal and its principal-scoped tags to build a query/search/delete
 predicate or to validate inserted/upserted rows. A caller that omits the
 principal must request `skip_rls=true` and pass the corresponding privilege
 check; otherwise the operation is denied.
@@ -66,6 +66,8 @@ client.set_rls_principal_tags(
     tags={
         "tenant": "acme",
         "department": "engineering",
+        "access_level": 3,
+        "risk_score": 0.25,
     },
 )
 ```
@@ -107,6 +109,15 @@ escaping.
 
 If an enabled RLS policy references a missing principal tag at runtime, that
 policy predicate evaluates to false for the current request.
+
+Principal tag values support `string`, `int64`, and `double`. The value keeps
+its declared type through the public API, RootCoord metadata, WAL replay, and
+Proxy snapshots. String tags match only string fields. Integer and floating-point
+tags may match either integer or floating-point fields when the required
+cross-type conversion preserves the value exactly. Fractional doubles cannot
+match integer fields, and integers that lose precision in the target floating
+type do not match. Any incompatible or lossy conversion evaluates that policy
+predicate to false; Milvus does not coerce between strings and numeric values.
 
 ## Row Policies
 
@@ -203,8 +214,8 @@ Supported expression forms:
 - `in` with literal value lists
 - `array_contains`, `array_contains_all`, and `array_contains_any` on primitive
   array fields
-- `$current_principal` and `$current_principal_tags['key']` as string template
-  values
+- `$current_principal` as a string template value and
+  `$current_principal_tags['key']` as a string, int64, or double template value
 
 Each individual `using_expr` or `check_expr` must contain exactly one simple
 predicate. Inline `and`, `or`, and boolean `not` are rejected; policy authors
@@ -250,60 +261,59 @@ lock only briefly while replacing the cached policy or principal entry. The
 post-image and drop callbacks are idempotent, so broadcaster recovery can retry
 them safely after a coordinator restart.
 
-Proxy maintains an in-memory RLS manager cache. RootCoord exposes an internal,
-collection-scoped `GetRLSMetadata` RPC that returns the collection identity,
-all row policies, and all principals with their complete tag maps in one
-response. Proxy startup only configures the RLS manager dependencies; it does
-not enumerate collections or preload metadata. Only a request that actually
-enforces RLS can establish or refresh a collection's RLS state.
+Proxy maintains collection-scoped policy state and principal-scoped tag state.
+RootCoord exposes a collection-scoped `GetRLSMetadata` RPC for the collection
+identity and all row policies. The same RPC accepts a principal filter and loads
+only the tag record for the principal on the current RLS-enforced request. Proxy
+startup only configures the RLS manager dependencies; it does not enumerate
+collections, policies, or principals.
 
-Each RLS WAL message carries the affected collection's Proxy cache expiration.
-After applying the metadata post-image or drop, the ACK callback synchronously
-invalidates that collection's complete RLS state on every active Proxy, using
-the same callback and retry model as AlterCollection schema invalidation. A
-real Proxy notification failure keeps the callback pending; the broadcaster
-retries it with exponential backoff while the collection resource remains
-serialized. The Proxy invalidation is intentionally lightweight and does not
-fetch metadata inside the callback.
+Policy WAL messages carry a collection policy-cache expiration. Principal-tag
+updates and drops carry the affected principal name and invalidate only the
+`(collectionID, principal)` tag entry on every active Proxy. Creating a new
+principal does not notify Proxy: missing principals are never negative-cached,
+so the first request after creation reads RootCoord normally. A real Proxy
+notification failure keeps the callback pending; the broadcaster retries it
+with exponential backoff while the collection resource remains serialized.
 
-The next RLS-enforced request observes the missing state and loads both policy
-and principal snapshots through one `GetRLSMetadata` call. There is no
-background reconciliation loop. On every RLS-enforced use, Proxy treats a
-snapshot whose last successful load is older than
-`proxy.rls.metaRefreshInterval` as stale and refreshes it synchronously. Thus a
-missed invalidation converges on the first request after the freshness window,
-while collections that are not accessed produce no metadata RPCs.
+The next RLS-enforced request observes missing policy or principal state and
+loads only the missing object. There is no proactive background refresh loop.
+On every RLS-enforced use, Proxy refreshes an expired collection policy entry
+synchronously. Principal cache hits do not perform a request-time age check;
+a scanner runs every ten minutes and removes principal entries older than
+`proxy.rls.metaRefreshInterval`, and the next use reloads a removed entry.
+Thus a missed policy invalidation converges on the first request after the
+freshness window, while a missed principal invalidation converges after the
+freshness window plus at most one scanner interval. Unused principals produce
+no metadata RPCs.
 
 As with Proxy collection-schema cache fills, a per-collection read/write
-barrier orders RLS refreshes against invalidation. A refresh holds the read
-side across its singleflight lifecycle; invalidation takes the write side,
-waits for earlier refreshes to finish, and then deletes the state. A refresh
-also writes only to the collection-state incarnation captured before its RPC,
-so a detached result cannot recreate or overwrite a later incarnation.
-Snapshot version tokens continue to suppress out-of-order refreshes within one
-live incarnation; they are not treated as authoritative RootCoord metadata
-revisions.
+barrier orders policy refreshes and collection drops against invalidation.
+Principal tags additionally use a `(collectionID, principal)` read/write
+barrier, so updating or deleting one principal waits only for that principal's
+in-flight load. Refreshes hold the read side through singleflight and
+invalidation takes the write side before deleting the entry. Policy snapshot
+version tokens suppress out-of-order policy writes but are not authoritative
+RootCoord metadata revisions; principal ordering is guaranteed by its keyed
+read/write barrier.
 
-Every RLS-enforced request checks both policy and principal-tag snapshot
-freshness before evaluating a predicate. A missing or expired snapshot is
-refreshed synchronously through `GetRLSMetadata`. If the refresh fails, the
-request fails closed and the expired snapshot is not used for authorization.
-Concurrent request-path refreshes for the same collection are coalesced.
+Every RLS-enforced request validates the collection policy entry and obtains the
+current principal tag entry before evaluating a predicate. A missing or expired
+policy entry and a missing principal entry are refreshed synchronously through
+`GetRLSMetadata`; principal lookups use its principal filter. If the refresh
+fails, the request fails closed and unavailable metadata is not used for
+authorization. Concurrent refreshes are coalesced independently per collection
+policy entry and per principal tag entry.
 
-The manager-level lock protects only the collection-state map and dependency
-configuration. A recyclable keyed read/write lock provides the
-per-collection refresh/invalidation barrier without serializing unrelated
-collections. Invalidation deletes the current state pointer; refreshes write
-only to the incarnation captured before their RPC. Each collection state has
-its own read/write lock for snapshot
-versions, refresh timestamps, policies, principal tags, and compiled predicate
-state. MixCoord RPCs are always executed without the manager or state lock
-held; only the target collection's refresh read guard spans the RPC, so
-metadata work for one collection cannot serialize another collection.
-On a compiled-cache hit, predicate evaluation holds the collection read lock
-only long enough to capture the immutable compiled expression and principal-tag
-snapshot. Expression cloning, template instantiation, and rewriting happen after
-the lock is released. A cache miss compiles under that collection's write lock.
+The manager-level lock protects the collection-policy map, principal-tag map,
+and dependency configuration. Recyclable keyed read/write locks provide the
+per-collection and per-principal refresh/invalidation barriers without
+serializing unrelated objects. Each collection state has its own lock for
+policy versions, policy refresh timestamps, collection identity, and compiled
+predicates. MixCoord RPCs run without the manager or collection-state lock;
+only the relevant keyed refresh guard spans the RPC. Predicate evaluation
+captures the immutable compiled expression and cloned principal tags, then
+instantiates the expression after releasing cache locks.
 
 RLS policy and principal-tag broadcast messages are eligible for the generic
 CDC path and are not marked unreplicable. On a secondary, the replicated
@@ -329,4 +339,4 @@ generic replicated-broadcast contract.
 | `proxy.rls.maxTagKeyLength` | Maximum principal tag key length. |
 | `proxy.rls.maxTagValueLength` | Maximum principal tag value length. |
 | `proxy.rls.maxArrayLiteralElements` | Maximum literal elements in `in` and `array_contains*` expressions. |
-| `proxy.rls.metaRefreshInterval` | Maximum age in seconds of cached policy and principal metadata before an RLS-enforced request refreshes it. |
+| `proxy.rls.metaRefreshInterval` | Maximum policy-cache age before request-time refresh, and principal-cache age before the periodic scanner removes an entry for refresh on its next use. |
